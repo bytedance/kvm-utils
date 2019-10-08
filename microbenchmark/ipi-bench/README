@@ -1,0 +1,6 @@
+HOWTO
+=====
+make
+insmod ipi_bench.ko
+
+dmesg
