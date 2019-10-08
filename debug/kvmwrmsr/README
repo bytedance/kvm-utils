@@ -1,0 +1,6 @@
+HOWTO
+=====
+make
+insmod kvmwrmsr.ko
+
+watch -n 1 "dmesg -c -T"
