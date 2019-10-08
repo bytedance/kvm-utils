@@ -1,0 +1,6 @@
+HOWTO
+=====
+make
+insmod kvmexitreason.ko
+
+watch -n 1 "dmesg -c -T"
