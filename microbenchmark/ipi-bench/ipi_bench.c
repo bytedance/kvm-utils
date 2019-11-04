@@ -4,18 +4,36 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include "../common/rdtsc.h"
+#include "../common/getns.h"
 
 #define LOOP 100000
+
+//#define USE_CYCLES
+#ifdef USE_CYCLES
+#define REPORT_STR "cycles"
+
+static inline unsigned long gettime(void)
+{
+	return ins_rdtsc();
+}
+#else
+#define REPORT_STR "ns"
+
+static inline unsigned long gettime(void)
+{
+	return getns();
+}
+#endif
 
 static inline void ipi_bench_report(char *tag, int wait, int srccpu, int dstcpu, unsigned long elapsed, unsigned long ipitime)
 {
 	printk(KERN_INFO "ipi_bench: %30s wait[%d], CPU%d[NODE%d] -> CPU%d[NODE%d], loop = %d\n",
 			tag, wait, srccpu, cpu_to_node(srccpu), dstcpu, cpu_to_node(dstcpu), LOOP);
-	printk(KERN_INFO "ipi_bench: %40s  elapsed = %ld cycles, average = %ld cycles\n",
-			"", elapsed, elapsed / LOOP);
+	printk(KERN_INFO "ipi_bench: %40s  elapsed = %16ld %s, average = %8ld %s\n",
+			"", elapsed, REPORT_STR, elapsed / LOOP, REPORT_STR);
 	if (ipitime != 0) {
-		printk(KERN_INFO "ipi_bench: %40s  ipitime = %ld cycles, average = %ld"
-				"cycles\n", "", ipitime, ipitime / LOOP);
+		printk(KERN_INFO "ipi_bench: %40s  ipitime = %16ld %s, average = %8ld %s\n",
+			"", ipitime, REPORT_STR, ipitime / LOOP, REPORT_STR);
 	}
 }
 
@@ -31,10 +49,10 @@ static void ipi_bench_spinlock(void *info)
 	spin_unlock(lock);
 }
 
-static void ipi_bench_rdtsc(void *info)
+static void ipi_bench_gettime(void *info)
 {
 	unsigned long *starttime = (unsigned long*)info;
-	unsigned long now = ins_rdtsc();
+	unsigned long now = gettime();
 
 	if(now > *starttime)
 		*starttime = now - *starttime;
@@ -49,11 +67,11 @@ static int ipi_bench_single(int currentcpu, int targetcpu, int wait)
 	unsigned long starttime, elapsed, ipitime;
 
 	ipitime = 0;
-	starttime = ins_rdtsc();
+	starttime = gettime();
 
 	for (loop = LOOP; loop > 0; loop--) {
-		unsigned long tsc = ins_rdtsc();
-		ret = smp_call_function_single(targetcpu, ipi_bench_rdtsc, &tsc, wait);
+		unsigned long tsc = gettime();
+		ret = smp_call_function_single(targetcpu, ipi_bench_gettime, &tsc, wait);
 		if (ret < 0)
 			return ret;
 
@@ -61,7 +79,7 @@ static int ipi_bench_single(int currentcpu, int targetcpu, int wait)
 			ipitime += tsc;
 	}
 
-	elapsed = ins_rdtsc() - starttime;
+	elapsed = gettime() - starttime;
 	ipi_bench_report("ipi_bench_single", !!wait, currentcpu,
 			targetcpu, elapsed, ipitime);
 
@@ -74,7 +92,7 @@ static int ipi_bench_many(int currentcpu, int wait, int uselock)
 	unsigned long starttime, elapsed;
 	DEFINE_SPINLOCK(lock);
 
-	starttime = ins_rdtsc();
+	starttime = gettime();
 
 	for (loop = LOOP; loop > 0; loop--) {
 		if (uselock)
@@ -83,7 +101,7 @@ static int ipi_bench_many(int currentcpu, int wait, int uselock)
 			smp_call_function_many(cpu_online_mask, ipi_bench_empty, NULL, wait);
 	}
 
-	elapsed = ins_rdtsc() - starttime;
+	elapsed = gettime() - starttime;
 	if (uselock) {
 		ipi_bench_report("ipi_bench_many lock", !!wait, currentcpu,
 				255, elapsed, 0);
