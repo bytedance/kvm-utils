@@ -7,6 +7,7 @@
 #include "../common/getns.h"
 
 #define LOOP 100000
+#define MAXNUMA 4
 
 //#define USE_CYCLES
 #ifdef USE_CYCLES
@@ -117,6 +118,8 @@ static int ipi_bench_init(void)
 {
 	unsigned int currentcpu, targetcpu;
 	int nodes = num_online_nodes();
+	unsigned int node;
+	unsigned char numa[MAXNUMA] = {0};
 
 	printk(KERN_INFO "ipi_bench: %s start\n", __func__);
 	printk(KERN_INFO "ipi_bench: %d NUMA node(s)\n", nodes);
@@ -125,34 +128,25 @@ static int ipi_bench_init(void)
 	currentcpu = get_cpu();
 	ipi_bench_single(currentcpu, currentcpu, 1);
 
-	/* case other cpu ipi from same NUMA node, wait ipi */
-	for_each_online_cpu(targetcpu) {
-		if (targetcpu == currentcpu)
-			continue;
-		if (cpu_to_node(targetcpu) != cpu_to_node(currentcpu))
-			continue;
-
-		break;
-	}
-	ipi_bench_single(currentcpu, targetcpu, 1);
-
-	/* case other cpu ipi from same NUMA node, don't wait ipi */
-	ipi_bench_single(currentcpu, targetcpu, 0);
-
-	if (nodes > 1) {
-		/* case other cpu ipi accross NUMA node, wait ipi */
+	/* from current cpu to each NUMA node IPI */
+	for (node = 0; node < nodes && node < MAXNUMA; node++) {
 		for_each_online_cpu(targetcpu) {
 			if (targetcpu == currentcpu)
 				continue;
-			if (cpu_to_node(targetcpu) == cpu_to_node(currentcpu))
+
+			if (numa[cpu_to_node(targetcpu)])
 				continue;
 
 			break;
 		}
+
+		/* case other cpu ipi accross NUMA node, wait ipi */
 		ipi_bench_single(currentcpu, targetcpu, 1);
 
 		/* case other cpu ipi accross NUMA node, don't wait ipi */
 		ipi_bench_single(currentcpu, targetcpu, 0);
+
+		numa[cpu_to_node(targetcpu)] = 1;
 	}
 
 	/* case ipi broadcast, wait ipi with lock */
