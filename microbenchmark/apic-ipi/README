@@ -1,0 +1,6 @@
+HOWTO
+=====
+make
+insmod apic_ipi.ko
+
+dmesg
