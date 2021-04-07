@@ -4,7 +4,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/delay.h>
-#include <asm/ipi.h>
+#include <asm/irq_vectors.h>
 #include <asm/apic.h>
 #include "../common/rdtsc.h"
 
