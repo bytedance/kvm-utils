@@ -1,6 +1,8 @@
 HOWTO
 =====
 make
-insmod apic_ipi.ko
+insmod apic_ipi.ko options=XXX
+
+XXX means bit flags, insmod apic_ipi.ko options=0 to get help.
 
 dmesg
