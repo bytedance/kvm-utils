@@ -9,7 +9,7 @@
 #define LOOP 100000
 #define MAXNUMA 4
 
-//#define USE_CYCLES
+#define USE_CYCLES
 #ifdef USE_CYCLES
 #define REPORT_STR "cycles"
 
@@ -52,32 +52,32 @@ static void ipi_bench_spinlock(void *info)
 
 static void ipi_bench_gettime(void *info)
 {
-	unsigned long *starttime = (unsigned long*)info;
+	unsigned long starttime = atomic_read(info);
 	unsigned long now = gettime();
+	unsigned long diff = 0;
 
-	if(now > *starttime)
-		*starttime = now - *starttime;
-	else
-		*starttime = 0;
-	/*	printk(KERN_INFO "ipi_bench: %s\n", __func__);	*/
+	if(now > starttime)
+		diff = now - starttime;
+
+	atomic_set(info, diff);
 }
 
 static int ipi_bench_single(int currentcpu, int targetcpu, int wait)
 {
 	int loop, ret;
-	unsigned long starttime, elapsed, ipitime;
+	unsigned long starttime, elapsed, ipitime, now;
 
 	ipitime = 0;
 	starttime = gettime();
 
 	for (loop = LOOP; loop > 0; loop--) {
-		unsigned long tsc = gettime();
-		ret = smp_call_function_single(targetcpu, ipi_bench_gettime, &tsc, wait);
+		atomic_set((atomic_t *)&now, gettime());
+		ret = smp_call_function_single(targetcpu, ipi_bench_gettime, &now, wait);
 		if (ret < 0)
 			return ret;
 
 		if (wait)
-			ipitime += tsc;
+			ipitime += atomic_read((const atomic_t *)&now);
 	}
 
 	elapsed = gettime() - starttime;
