@@ -1,6 +1,16 @@
 HOWTO
 =====
-make
-insmod ipi_bench.ko
+~# make
 
-dmesg
+To get benchmark options
+------------------------
+~# insmod ipi_bench.ko ; dmesg -c
+ipi_bench: you should run insmod ipi_bench.ko options=XX, bit flags:
+ipi_bench:	bit[0] self-ipi: send ipi to self, you can specify CPU by param srccpu=XX(default current CPU).
+ipi_bench:	bit[1] single-ipi: send ipi from srccpu=XX to dstcpu=YY(default different random XX and YY), wait=0/1 to specify wait or not.
+ipi_bench:	bit[2] mesh-ipi: send single ipi from one CPU to another CPU for all the CPUs, use pairs=XX to set number of benchmark pairs(default num_cpus / 2).
+ipi_bench:	bit[3] all-ipi: send ipi from srccpu=XX to all the CPUs, use lock=0/1 to specify spin lock option in callback function, wait=0/1 to specify wait or not.
+
+To run single-ipi from CPU3 to CPU8
+-----------------------------------
+~# insmod ipi_bench.ko options=2 srccpu=3 dstcpu=8 ; dmesg -c

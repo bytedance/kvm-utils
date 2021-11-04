@@ -1,15 +1,16 @@
 /*
- * Copyright (C) 2019 zhenwei pi pizhenwei@bytedance.com.
+ * Copyright (C) 2019-2021 zhenwei pi pizhenwei@bytedance.com.
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/kthread.h>
+#include <linux/wait.h>
+#include <linux/slab.h>
+#include <linux/random.h>
 #include "../common/rdtsc.h"
 #include "../common/getns.h"
 
-#define LOOP 100000
-#define MAXNUMA 4
-
-#define USE_CYCLES
+//#define USE_CYCLES
 #ifdef USE_CYCLES
 #define REPORT_STR "cycles"
 
@@ -20,22 +21,149 @@ static inline unsigned long gettime(void)
 #else
 #define REPORT_STR "ns"
 
-static inline unsigned long gettime(void)
+static inline long unsigned gettime(void)
 {
 	return getns();
 }
 #endif
 
-static inline void ipi_bench_report(char *tag, int wait, int srccpu, int dstcpu, unsigned long elapsed, unsigned long ipitime)
+static int loops = 1000000;
+module_param(loops, int, 0444);
+
+static int srccpu = -1;
+module_param(srccpu, int, 0444);
+
+static int dstcpu = -1;
+module_param(dstcpu, int, 0444);
+
+static int pairs = -1;
+module_param(pairs, int, 0444);
+
+static int acrossnuma = 1;
+module_param(acrossnuma, int, 0444);
+
+static int broadcasts = -1;
+module_param(broadcasts, int, 0444);
+
+static int __read_mostly wait = 1;
+module_param(wait, int, 0444);
+
+static int __read_mostly lock = 1;
+module_param(lock, int, 0444);
+
+static int options;
+module_param(options, int, 0444);
+
+static unsigned long timeoutms = 10000;
+
+static atomic64_t ready_to_run;
+static atomic64_t should_run;
+static atomic64_t complete_run;
+
+static DECLARE_WAIT_QUEUE_HEAD(wait_complete);
+
+#define SELF_IPI	(1<<0)
+#define SINGLE_IPI	(1<<1)
+#define MESH_IPI	(1<<2)
+#define ALL_IPI		(1<<3)
+
+static char *benchcases[] = {
+	"self-ipi: send ipi to self, you can specify CPU by param srccpu=XX(default current CPU).",
+	"single-ipi: send ipi from srccpu=XX to dstcpu=YY(default different random XX and YY), wait=0/1 to specify wait or not.",
+	"mesh-ipi: send single ipi from one CPU to another CPU for all the CPUs, use pairs=XX to set number of benchmark pairs(default num_cpus / 2); use acrossnuma=0/1 to set IPI across NUMA(default = 1).",
+	"all-ipi: send ipi from one CPU to all the CPUs, use lock=0/1 to specify spin lock option in callback function; wait=0/1 to specify wait or not; use broadcasts=XX to set workers(default 1).",
+};
+
+struct bench_args {
+	int src;		/* src CPU */
+	int dst;		/* dst CPU */
+	atomic64_t forked;	/* forked timestamp */
+	atomic64_t start;	/* start to run timestamp */
+	atomic64_t finish;	/* finish bench timestamp */
+	atomic64_t ipitime;	/* ipi time */
+	char name[64];
+};
+
+static inline unsigned long __random(void)
 {
-	printk(KERN_INFO "ipi_bench: %30s wait[%d], CPU%d[NODE%d] -> CPU%d[NODE%d], loop = %d\n",
-			tag, wait, srccpu, cpu_to_node(srccpu), dstcpu, cpu_to_node(dstcpu), LOOP);
-	printk(KERN_INFO "ipi_bench: %40s  elapsed = %16ld %s, average = %8ld %s\n",
-			"", elapsed, REPORT_STR, elapsed / LOOP, REPORT_STR);
-	if (ipitime != 0) {
-		printk(KERN_INFO "ipi_bench: %40s  ipitime = %16ld %s, average = %8ld %s\n",
-			"", ipitime, REPORT_STR, ipitime / LOOP, REPORT_STR);
+	return get_random_long();
+}
+
+static void ipi_bench_gettime(void *info)
+{
+	unsigned long starttime = atomic64_read(info);
+	unsigned long now = gettime();
+	unsigned long diff = 0;
+
+	if(now > starttime)
+		diff = now - starttime;
+
+	atomic64_set(info, diff);
+}
+
+static int ipi_bench_one(struct bench_args *ba)
+{
+	unsigned long ipitime = 0, now;
+	int loop, ret, dst = ba->dst;
+
+	for (loop = loops; loop > 0; loop--) {
+		atomic64_set((atomic64_t *)&now, gettime());
+		ret = smp_call_function_single(dst, ipi_bench_gettime, &now, wait);
+		if (ret < 0)
+			return ret;
+
+		if (wait)
+			ipitime += atomic64_read((const atomic64_t *)&now);
 	}
+
+	atomic64_set(&ba->ipitime, ipitime);
+
+	return 0;
+}
+
+static int ipi_bench_single_task(void *data)
+{
+	struct bench_args *ba = (struct bench_args*)data;
+
+	atomic64_set(&ba->forked, gettime());
+
+	/* let all threads run at the same time. to avoid wakeup delay */
+	atomic64_add(1, (atomic64_t *)&ready_to_run);
+	while (atomic64_read(&ready_to_run) < atomic64_read(&should_run));
+	if (atomic64_read(&ready_to_run) != atomic64_read(&should_run)) {
+		printk(KERN_INFO "ipi_bench: BUG, exit benchmark\n");
+		return -1;
+	}
+
+	atomic64_set(&ba->start, gettime());
+	ipi_bench_one(ba);
+	atomic64_set(&ba->finish, gettime());
+	atomic64_add(1, (atomic64_t *)&complete_run);
+
+	wake_up_interruptible(&wait_complete);
+
+	return 0;
+}
+
+static int ipi_bench_one_task(struct bench_args *ba)
+{
+	struct task_struct *tsk;
+	int src = ba->src;
+	int dst = ba->dst;
+
+	printk(KERN_INFO "ipi_bench: prepare single IPI from CPU[%3d] to CPU[%3d]\n", src, dst);
+	snprintf(ba->name, sizeof(ba->name), "ipi_bench_%d_%d", src, dst);
+
+	tsk = kthread_create_on_node(ipi_bench_single_task, ba, cpu_to_node(src), ba->name);
+	if (IS_ERR(tsk)) {
+		printk(KERN_INFO "ipi_bench: create kthread failed\n");
+		return -1;
+	}
+
+	kthread_bind(tsk, src);
+	wake_up_process(tsk);
+
+	return 0;
 }
 
 static void ipi_bench_empty(void *info)
@@ -50,65 +178,341 @@ static void ipi_bench_spinlock(void *info)
 	spin_unlock(lock);
 }
 
-static void ipi_bench_gettime(void *info)
+static int ipi_bench_many(void)
 {
-	unsigned long starttime = atomic_read(info);
-	unsigned long now = gettime();
-	unsigned long diff = 0;
+	int loop;
+	DEFINE_SPINLOCK(spinlock);
 
-	if(now > starttime)
-		diff = now - starttime;
-
-	atomic_set(info, diff);
-}
-
-static int ipi_bench_single(int currentcpu, int targetcpu, int wait)
-{
-	int loop, ret;
-	unsigned long starttime, elapsed, ipitime, now;
-
-	ipitime = 0;
-	starttime = gettime();
-
-	for (loop = LOOP; loop > 0; loop--) {
-		atomic_set((atomic_t *)&now, gettime());
-		ret = smp_call_function_single(targetcpu, ipi_bench_gettime, &now, wait);
-		if (ret < 0)
-			return ret;
-
-		if (wait)
-			ipitime += atomic_read((const atomic_t *)&now);
+	for (loop = loops; loop > 0; loop--) {
+		if (lock) {
+			smp_call_function_many(cpu_online_mask, ipi_bench_spinlock, &spinlock, wait);
+		} else {
+			smp_call_function_many(cpu_online_mask, ipi_bench_empty, NULL, wait);
+		}
 	}
-
-	elapsed = gettime() - starttime;
-	ipi_bench_report("ipi_bench_single", !!wait, currentcpu,
-			targetcpu, elapsed, ipitime);
 
 	return 0;
 }
 
-static int ipi_bench_many(int currentcpu, int wait, int uselock)
+static int ipi_bench_many_task(void *data)
 {
-	int loop;
-	unsigned long starttime, elapsed;
-	DEFINE_SPINLOCK(lock);
+	struct bench_args *ba = (struct bench_args*)data;
 
-	starttime = gettime();
+	atomic64_set(&ba->forked, gettime());
 
-	for (loop = LOOP; loop > 0; loop--) {
-		if (uselock)
-			smp_call_function_many(cpu_online_mask, ipi_bench_spinlock, &lock, wait);
-		else
-			smp_call_function_many(cpu_online_mask, ipi_bench_empty, NULL, wait);
+	/* let all threads run at the same time. to avoid wakeup delay */
+	atomic64_add(1, (atomic64_t *)&ready_to_run);
+	while (atomic64_read(&ready_to_run) < atomic64_read(&should_run));
+	if (atomic64_read(&ready_to_run) != atomic64_read(&should_run)) {
+		printk(KERN_INFO "ipi_bench: BUG, exit benchmark\n");
+		return -1;
 	}
 
-	elapsed = gettime() - starttime;
-	if (uselock) {
-		ipi_bench_report("ipi_bench_many lock", !!wait, currentcpu,
-				255, elapsed, 0);
-	} else {
-		ipi_bench_report("ipi_bench_many nolcok", !!wait, currentcpu,
-				255, elapsed, 0);
+	atomic64_set(&ba->start, gettime());
+	ipi_bench_many();
+	atomic64_set(&ba->finish, gettime());
+	atomic64_add(1, (atomic64_t *)&complete_run);
+
+	wake_up_interruptible(&wait_complete);
+
+	return 0;
+}
+
+static int ipi_bench_all_task(struct bench_args *ba)
+{
+	struct task_struct *tsk;
+	int src = ba->src;
+
+	printk(KERN_INFO "ipi_bench: prepare broadcast IPI from CPU[%3d] to all CPUs\n", src);
+	snprintf(ba->name, sizeof(ba->name), "ipi_bench_all_%d", src);
+
+	tsk = kthread_create_on_node(ipi_bench_many_task, ba, cpu_to_node(src), ba->name);
+	if (IS_ERR(tsk)) {
+		printk(KERN_INFO "ipi_bench: create kthread failed\n");
+		return -1;
+	}
+
+	kthread_bind(tsk, src);
+	wake_up_process(tsk);
+
+	return 0;
+}
+
+static inline void ipi_bench_wait_all(void)
+{
+	wait_event_interruptible_timeout(wait_complete,
+			atomic64_read(&complete_run) == atomic64_read(&should_run),
+			msecs_to_jiffies(timeoutms));
+}
+
+static inline void ipi_bench_report_single(struct bench_args *ba)
+{
+	int src = ba->src;
+	int dst = ba->dst;
+	unsigned long forked = atomic64_read(&ba->forked);
+	unsigned long start = atomic64_read(&ba->start);
+	unsigned long finish = atomic64_read(&ba->finish);
+	unsigned long ipitime = atomic64_read(&ba->ipitime);
+	unsigned long elapsed = finish - start;
+
+	if (!finish) {
+		printk(KERN_INFO "ipi_bench: too many loops\n");
+		return;
+	}
+
+	printk(KERN_INFO "ipi_bench: CPU [%3d] [NODE%d] -> CPU [%3d] [NODE%d], wait [%d], loops [%d] "
+			"forked [%ld], start [%ld], finish [%ld], elapsed [%ld], ipitime [%ld] in %s/1000, "
+			"AVG call [%ld], ipi [%ld] in %s\n",
+			src, cpu_to_node(src), dst, cpu_to_node(dst), wait, loops,
+			forked / 1000, start / 1000, finish / 1000, elapsed / 1000, ipitime / 1000, REPORT_STR,
+			elapsed / loops, ipitime / loops, REPORT_STR);
+}
+
+static inline void ipi_bench_report_all(struct bench_args *ba)
+{
+	int src = ba->src;
+	unsigned long forked = atomic64_read(&ba->forked);
+	unsigned long start = atomic64_read(&ba->start);
+	unsigned long finish = atomic64_read(&ba->finish);
+	unsigned long elapsed = finish - start;
+
+	if (!finish) {
+		printk(KERN_INFO "ipi_bench: too many loops\n");
+		return;
+	}
+
+	printk(KERN_INFO "ipi_bench: CPU [%3d] [NODE%d] -> all CPUs, wait [%d], loops [%d] "
+			"forked [%ld], start [%ld], finish [%ld], elapsed [%ld] in %s/1000, "
+			"AVG call [%ld] in %s\n",
+			src, cpu_to_node(src), wait, loops,
+			forked / 1000, start / 1000, finish / 1000, elapsed / 1000, REPORT_STR,
+			elapsed / loops, REPORT_STR);
+}
+
+static int ipi_bench_self(int src)
+{
+	struct bench_args *ba;
+
+	ba = kzalloc(sizeof(*ba), GFP_KERNEL);
+	if (!ba) {
+		printk(KERN_INFO "ipi_bench: no enough memory\n");
+		return -1;
+	}
+
+	ba->src = src;
+	ba->dst = src;
+
+	atomic64_set(&should_run, 1);
+	ipi_bench_one_task(ba);
+	ipi_bench_wait_all();
+	ipi_bench_report_single(ba);
+
+	kfree(ba);
+
+	return 0;
+}
+
+static int ipi_bench_single(int src, int dst)
+{
+	struct bench_args *ba;
+
+	ba = kzalloc(sizeof(*ba), GFP_KERNEL);
+	if (!ba) {
+		printk(KERN_INFO "ipi_bench: no enough memory\n");
+		return -1;
+	}
+
+	ba->src = src;
+	ba->dst = dst;
+
+	atomic64_set(&should_run, 1);
+	ipi_bench_one_task(ba);
+	ipi_bench_wait_all();
+	ipi_bench_report_single(ba);
+
+	kfree(ba);
+
+	return 0;
+}
+
+/* node: select an valid CPU which belongs to. ignore -1 */
+static int __random_unused_cpu_in_cpumask(cpumask_var_t cpumask, int node)
+{
+	int num_cpus = num_online_cpus();
+	int retry = 100000;
+	int cpu = -1;
+
+	while (retry--) {
+		cpu = __random() % num_cpus;
+		if (cpumask_test_cpu(cpu, cpumask)) {
+			continue;
+		}
+
+		if ((node >= 0) && (cpu_to_node(cpu) != node)) {
+			continue;
+		}
+
+		cpumask_set_cpu(cpu, cpumask);
+		return cpu;
+	};
+
+	return -1;
+}
+
+static int ipi_bench_mesh(int pairs, int acrossnuma)
+{
+	cpumask_var_t cpumask;
+	struct bench_args *bas = NULL;
+	struct bench_args *ba;
+	unsigned long startns, elapsed;
+	int ret = -1, i, node = -1;
+
+	zalloc_cpumask_var(&cpumask, GFP_KERNEL);
+	bas = kzalloc(sizeof(*ba) * pairs, GFP_KERNEL);
+	if (!bas) {
+		printk(KERN_INFO "ipi_bench: no enough memory\n");
+		goto out;
+	}
+
+	atomic64_set(&should_run, pairs);
+
+	/* build pairs one by one */
+	for (i = 0; i < pairs; i++) {
+		ba = bas + i;
+		ba->src = __random_unused_cpu_in_cpumask(cpumask, -1);
+		if (!acrossnuma) {
+			node = cpu_to_node(ba->src);
+		}
+		ba->dst = __random_unused_cpu_in_cpumask(cpumask, node);
+
+		if ((ba->src < 0) || (ba->dst < 0)) {
+			printk(KERN_INFO "ipi_bench: init mesh failed\n");
+			goto out;
+		}
+	}
+
+	for (i = 0; i < pairs; i++) {
+		ba = bas + i;
+		ipi_bench_one_task(ba);
+	}
+
+	startns = getns();
+	ipi_bench_wait_all();
+	elapsed = getns() - startns;
+
+	for (i = 0; i < pairs; i++) {
+		ba = bas + i;
+		ipi_bench_report_single(ba);
+	}
+
+	printk(KERN_INFO "ipi_bench: throughput %ld ipi/s\n", pairs * loops * 1000000000UL / elapsed);
+
+	ret = 0;
+
+out:
+	kfree(bas);
+	free_cpumask_var(cpumask);
+
+	return ret;
+}
+
+static int ipi_bench_all(int broadcasts)
+{
+	cpumask_var_t cpumask;
+	struct bench_args *bas = NULL;
+	struct bench_args *ba;
+	unsigned long startns, elapsed;
+	int ret = -1, i;
+
+	zalloc_cpumask_var(&cpumask, GFP_KERNEL);
+	bas = kzalloc(sizeof(*ba) * broadcasts, GFP_KERNEL);
+	if (!bas) {
+		printk(KERN_INFO "ipi_bench: no enough memory\n");
+		goto out;
+	}
+
+	atomic64_set(&should_run, broadcasts);
+
+	/* build broadcasts one by one */
+	for (i = 0; i < broadcasts; i++) {
+		ba = bas + i;
+		ba->src = __random_unused_cpu_in_cpumask(cpumask, -1);
+		if (ba->src < 0) {
+			printk(KERN_INFO "ipi_bench: init broadcast workers failed\n");
+			goto out;
+		}
+	}
+
+	for (i = 0; i < broadcasts; i++) {
+		ba = bas + i;
+		ipi_bench_all_task(ba);
+	}
+
+	startns = getns();
+	ipi_bench_wait_all();
+	elapsed = getns() - startns;
+
+	for (i = 0; i < broadcasts; i++) {
+		ba = bas + i;
+		ipi_bench_report_all(ba);
+	}
+
+
+	printk(KERN_INFO "ipi_bench: throughput %ld ipi/s\n", broadcasts * (num_online_cpus() - 1) * loops * 1000000000UL / elapsed);
+
+	ret = 0;
+
+out:
+	kfree(bas);
+	free_cpumask_var(cpumask);
+
+	return ret;
+}
+
+static void ipi_bench_options(void)
+{
+	int i;
+
+	printk(KERN_INFO "ipi_bench: you should run insmod ipi_bench.ko options=XX, bit flags:\n");
+	for (i = 0; i < sizeof(benchcases) / sizeof(benchcases[0]); i++) {
+		printk(KERN_INFO "ipi_bench:\tbit[%d] %s\n", i, benchcases[i]);
+	}
+}
+
+/* assign different src & dst cpu if unspecified */
+static int ipi_bench_init_params(void)
+{
+	int num_cpus = num_online_cpus();
+
+	if (num_cpus < 2) {
+		printk(KERN_INFO "ipi_bench: total cpu num %d, no need to test\n", num_cpus);
+		return -1;
+	}
+
+	if ((srccpu >= num_cpus) || (dstcpu >= num_cpus)) {
+		printk(KERN_INFO "ipi_bench: cpu out of range, total cpu num %d\n", num_cpus);
+		return -1;
+	}
+
+	if (pairs > (num_cpus / 2)) {
+		printk(KERN_INFO "ipi_bench: pairs out of range, total cpu num %d\n", num_cpus);
+		return -1;
+	}
+
+	while ((srccpu == -1) || (srccpu == dstcpu)) {
+		srccpu = __random() % num_cpus;
+	}
+
+	while ((dstcpu == -1) || (srccpu == dstcpu)) {
+		dstcpu = __random() % num_cpus;
+	}
+
+	if (pairs == -1) {
+		pairs = num_cpus / 2;
+	}
+
+	if (broadcasts == -1) {
+		broadcasts = 1;
 	}
 
 	return 0;
@@ -116,53 +520,30 @@ static int ipi_bench_many(int currentcpu, int wait, int uselock)
 
 static int ipi_bench_init(void)
 {
-	unsigned int currentcpu, targetcpu;
-	int nodes = num_online_nodes();
-	unsigned int node;
-	unsigned char numa[MAXNUMA] = {0};
-
-	printk(KERN_INFO "ipi_bench: %s start\n", __func__);
-	printk(KERN_INFO "ipi_bench: %d NUMA node(s)\n", nodes);
-
-	/* case self ipi, in fact, kernel just call func without IPI */
-	currentcpu = get_cpu();
-	ipi_bench_single(currentcpu, currentcpu, 1);
-
-	/* from current cpu to each NUMA node IPI */
-	for (node = 0; node < nodes && node < MAXNUMA; node++) {
-		for_each_online_cpu(targetcpu) {
-			if (targetcpu == currentcpu)
-				continue;
-
-			if (numa[cpu_to_node(targetcpu)])
-				continue;
-
-			break;
-		}
-
-		/* case other cpu ipi accross NUMA node, wait ipi */
-		ipi_bench_single(currentcpu, targetcpu, 1);
-
-		/* case other cpu ipi accross NUMA node, don't wait ipi */
-		ipi_bench_single(currentcpu, targetcpu, 0);
-
-		numa[cpu_to_node(targetcpu)] = 1;
+	if (!options) {
+		ipi_bench_options();
+		return -1;
 	}
 
-	/* case ipi broadcast, wait ipi with lock */
-	ipi_bench_many(currentcpu, 1, 1);
+	if (ipi_bench_init_params() < 0) {
+		return -1;
+	}
 
-	/* case ipi broadcast, don't wait ipi with lock */
-	ipi_bench_many(currentcpu, 0, 1);
+	if (options & SELF_IPI) {
+		ipi_bench_self(srccpu);
+	}
 
-	/* case ipi broadcast, wait ipi */
-	ipi_bench_many(currentcpu, 1, 0);
+	if (options & SINGLE_IPI) {
+		ipi_bench_single(srccpu, dstcpu);
+	}
 
-	/* case ipi broadcast, don't wait ipi */
-	ipi_bench_many(currentcpu, 0, 0);
+	if (options & MESH_IPI) {
+		ipi_bench_mesh(pairs, acrossnuma);
+	}
 
-	put_cpu();
-	printk(KERN_INFO "ipi_bench: %s finish\n", __func__);
+	if (options & ALL_IPI) {
+		ipi_bench_all(broadcasts);
+	}
 
 	return -1;
 }
