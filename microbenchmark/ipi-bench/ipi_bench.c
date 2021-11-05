@@ -10,22 +10,10 @@
 #include "../common/rdtsc.h"
 #include "../common/getns.h"
 
-//#define USE_CYCLES
-#ifdef USE_CYCLES
-#define REPORT_STR "cycles"
-
-static inline unsigned long gettime(void)
-{
-	return ins_rdtsc();
-}
-#else
-#define REPORT_STR "ns"
-
 static inline long unsigned gettime(void)
 {
 	return getns();
 }
-#endif
 
 static int loops = 1000000;
 module_param(loops, int, 0444);
@@ -81,6 +69,9 @@ struct bench_args {
 	atomic64_t start;	/* start to run timestamp */
 	atomic64_t finish;	/* finish bench timestamp */
 	atomic64_t ipitime;	/* ipi time */
+#ifdef CONFIG_SCHED_INFO
+	atomic64_t run_delay;	/* sched run delay */
+#endif
 	char name[64];
 };
 
@@ -121,6 +112,13 @@ static int ipi_bench_one(struct bench_args *ba)
 	return 0;
 }
 
+static void ipi_bench_record_run_delay(struct bench_args *ba)
+{
+#ifdef CONFIG_SCHED_INFO
+	atomic64_set(&ba->run_delay, current->sched_info.run_delay);
+#endif
+}
+
 static int ipi_bench_single_task(void *data)
 {
 	struct bench_args *ba = (struct bench_args*)data;
@@ -138,6 +136,7 @@ static int ipi_bench_single_task(void *data)
 	atomic64_set(&ba->start, gettime());
 	ipi_bench_one(ba);
 	atomic64_set(&ba->finish, gettime());
+	ipi_bench_record_run_delay(ba);
 	atomic64_add(1, (atomic64_t *)&complete_run);
 
 	wake_up_interruptible(&wait_complete);
@@ -211,6 +210,7 @@ static int ipi_bench_many_task(void *data)
 	atomic64_set(&ba->start, gettime());
 	ipi_bench_many();
 	atomic64_set(&ba->finish, gettime());
+	ipi_bench_record_run_delay(ba);
 	atomic64_add(1, (atomic64_t *)&complete_run);
 
 	wake_up_interruptible(&wait_complete);
@@ -253,6 +253,7 @@ static inline void ipi_bench_report_single(struct bench_args *ba)
 	unsigned long start = atomic64_read(&ba->start);
 	unsigned long finish = atomic64_read(&ba->finish);
 	unsigned long ipitime = atomic64_read(&ba->ipitime);
+	unsigned long run_delay = atomic64_read(&ba->run_delay);
 	unsigned long elapsed = finish - start;
 
 	if (!finish) {
@@ -260,12 +261,16 @@ static inline void ipi_bench_report_single(struct bench_args *ba)
 		return;
 	}
 
+	if (elapsed > run_delay) {
+		elapsed -= run_delay;
+	}
+
 	printk(KERN_INFO "ipi_bench: CPU [%3d] [NODE%d] -> CPU [%3d] [NODE%d], wait [%d], loops [%d] "
-			"forked [%ld], start [%ld], finish [%ld], elapsed [%ld], ipitime [%ld] in %s/1000, "
-			"AVG call [%ld], ipi [%ld] in %s\n",
+			"forked [%ld], start [%ld], finish [%ld], elapsed [%ld], ipitime [%ld], run delay [%ld] in ms, "
+			"AVG call [%ld], ipi [%ld] in ns\n",
 			src, cpu_to_node(src), dst, cpu_to_node(dst), wait, loops,
-			forked / 1000, start / 1000, finish / 1000, elapsed / 1000, ipitime / 1000, REPORT_STR,
-			elapsed / loops, ipitime / loops, REPORT_STR);
+			forked / 1000, start / 1000, finish / 1000, elapsed / 1000, ipitime / 1000, run_delay / 1000,
+			elapsed / loops, ipitime / loops);
 }
 
 static inline void ipi_bench_report_all(struct bench_args *ba)
@@ -274,6 +279,7 @@ static inline void ipi_bench_report_all(struct bench_args *ba)
 	unsigned long forked = atomic64_read(&ba->forked);
 	unsigned long start = atomic64_read(&ba->start);
 	unsigned long finish = atomic64_read(&ba->finish);
+	unsigned long run_delay = atomic64_read(&ba->run_delay);
 	unsigned long elapsed = finish - start;
 
 	if (!finish) {
@@ -281,12 +287,16 @@ static inline void ipi_bench_report_all(struct bench_args *ba)
 		return;
 	}
 
+	if (elapsed > run_delay) {
+		elapsed -= run_delay;
+	}
+
 	printk(KERN_INFO "ipi_bench: CPU [%3d] [NODE%d] -> all CPUs, wait [%d], loops [%d] "
-			"forked [%ld], start [%ld], finish [%ld], elapsed [%ld] in %s/1000, "
-			"AVG call [%ld] in %s\n",
+			"forked [%ld], start [%ld], finish [%ld], elapsed [%ld], run delay [%ld] in ms "
+			"AVG call [%ld] in ns\n",
 			src, cpu_to_node(src), wait, loops,
-			forked / 1000, start / 1000, finish / 1000, elapsed / 1000, REPORT_STR,
-			elapsed / loops, REPORT_STR);
+			forked / 1000, start / 1000, finish / 1000, elapsed / 1000, run_delay / 1000,
+			elapsed / loops);
 }
 
 static int ipi_bench_self(int src)
