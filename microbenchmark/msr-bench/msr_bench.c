@@ -3,9 +3,12 @@
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include "msr-index.h"
 #include "msr.h"
 #include "../common/rdtsc.h"
+
+/* see intel SDM, or linux source code */
+#define __MSR_IA32_TSCDEADLINE		0x000006e0
+#define __MSR_IA32_POWER_CTL		0x000001fc
 
 #define LOOP 100000
 
@@ -30,7 +33,7 @@ static inline int wrmsr_bench(char *tag, unsigned int msr, unsigned long val)
 
 		/* bench loop */
 		for (loop = LOOP; loop > 0; loop--)
-			ins_wrmsrl(MSR_IA32_TSCDEADLINE, val);
+			ins_wrmsrl(__MSR_IA32_TSCDEADLINE, val);
 	} else {
 		printk(KERN_INFO "msr_bench: wrmsr %s fail, "
 				"benchmark native safe API\n", tag);
@@ -50,7 +53,7 @@ static int wrmsr_bench_tscdeadline(void)
 	 */
 	unsigned long val = ins_rdtsc() + 10*1000*1000*1000UL;
 
-	return wrmsr_bench("MSR_IA32_TSCDEADLINE", MSR_IA32_TSCDEADLINE, val);
+	return wrmsr_bench("MSR_IA32_TSCDEADLINE", __MSR_IA32_TSCDEADLINE, val);
 }
 
 static int wrmsr_bench_power(void)
@@ -58,7 +61,7 @@ static int wrmsr_bench_power(void)
 	/* kvm does not support this msr, just test vm-exit. */
 	unsigned long val = 0;
 
-	return wrmsr_bench("MSR_IA32_POWER_CTL", MSR_IA32_POWER_CTL, val);
+	return wrmsr_bench("MSR_IA32_POWER_CTL", __MSR_IA32_POWER_CTL, val);
 }
 
 
